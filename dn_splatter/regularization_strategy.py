@@ -129,7 +129,8 @@ class DNRegularization(RegularizationStrategy):
         depth_tolerance: float = 0.1,
         depth_loss_type: Optional[DepthLossType] = DepthLossType.EdgeAwareLogL1,
         depth_lambda: float = 0.2,
-        normal_lambda: float = 0.1,
+        normal_lambda: float = 1.0,
+        normal_smooth_lambda: float = 1.0,
     ):
         super().__init__()
         self.depth_tolerance = depth_tolerance
@@ -142,18 +143,31 @@ class DNRegularization(RegularizationStrategy):
         self.normal_smooth_loss_type: NormalLossType = NormalLossType.Smooth
         self.normal_smooth_loss = NormalLoss(self.normal_smooth_loss_type)
         self.normal_lambda = normal_lambda
+        self.normal_smooth_lambda = normal_smooth_lambda
+        self.last_components: dict = {}
 
     def get_loss(self, pred_depth, gt_depth, pred_normal, gt_normal, **kwargs):
-        """Regularization loss"""
-
-        depth_loss, normal_loss = 0.0, 0.0
+        """Regularization loss. Normal terms are weighted (normal_lambda / normal_smooth_lambda) and
+        each component is stashed in self.last_components for accurate per-term TensorBoard logging."""
+        depth_loss = 0.0
         if self.depth_loss is not None:
             depth_loss = self.get_depth_loss(pred_depth, gt_depth, **kwargs)
+        normal_l1, normal_smooth = 0.0, 0.0
         if self.normal_loss is not None:
-            normal_loss = self.get_normal_loss(pred_normal, gt_normal, **kwargs)
-        scales = kwargs["scales"]
-        scale_loss = self.get_scale_loss(scales=scales)
-        return depth_loss + normal_loss + scale_loss
+            normal_l1 = self.normal_lambda * self.normal_loss(pred_normal, gt_normal)
+            normal_smooth = self.normal_smooth_lambda * self.normal_smooth_loss(pred_normal)
+        scale_loss = self.get_scale_loss(scales=kwargs["scales"])
+
+        def _d(x):
+            return x.detach() if torch.is_tensor(x) else torch.tensor(float(x))
+
+        self.last_components = {
+            "loss_depth": _d(depth_loss),
+            "loss_normal_l1": _d(normal_l1),
+            "loss_normal_smooth": _d(normal_smooth),
+            "loss_dn_scale": _d(scale_loss),
+        }
+        return depth_loss + normal_l1 + normal_smooth + scale_loss
 
     def get_depth_loss(self, pred_depth, gt_depth, **kwargs):
         """Depth loss"""

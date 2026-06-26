@@ -457,7 +457,7 @@ class DepthAndNormalMapsPoisson(GSMeshExporter):
                     normal_map = (normal_map + 1) / 2
 
                     normal_map = outputs["surface_normal"].cpu()
-                    normal_map = normal_map.view(-1, 3)[indices]
+                    normal_map = normal_map.view(-1, 3)[indices.to(normal_map.device)]
 
                 if crop_box is not None:
                     inside_crop = crop_box.within(xyzs).squeeze()

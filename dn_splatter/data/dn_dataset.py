@@ -35,7 +35,12 @@ class GDataset(InputDataset):
         if "load_depths" in self.metadata:
             self.load_depths = self.metadata["load_depths"]
         else:
-            self.load_depths = True
+            # only load depths if depth filenames actually exist AND are non-empty (the dataparser
+            # adds the key as None/[] even for RGB-only datasets, so check the value, not the key)
+            self.load_depths = any(
+                self.metadata.get(k)
+                for k in ("depth_filenames", "sensor_depth_filenames", "mono_depth_filenames")
+            )
 
         if "load_normals" in self.metadata:
             self.load_normals = self.metadata["load_normals"]

@@ -27,6 +27,9 @@ class DNSplatterManagerConfig(FullImageDatamanagerConfig):
 
     camera_res_scale_factor: float = 1.0
     """Rescale cameras"""
+    random_image_sampling: bool = False
+    """If True, shuffle train-image order each epoch (random sampling). If False (default), keep the
+    temporal t-1,t,t+1 capture order (DN-Splatter's original behavior, good for depth/normal smoothness)."""
 
 
 class DNSplatterDataManager(FullImageDatamanager):
@@ -90,10 +93,12 @@ class DNSplatterDataManager(FullImageDatamanager):
     def next_train(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next training batch"""
 
-        # Don't randomly sample train images (keep t-1, t, t+1 ordering).
+        # Image order: temporal t-1,t,t+1 by default; shuffled each epoch if random_image_sampling.
         self.image_idx = self.train_unseen_cameras.pop(0)
         if len(self.train_unseen_cameras) == 0:
             self.train_unseen_cameras = [i for i in range(len(self.train_dataset))]
+            if self.config.random_image_sampling:
+                random.shuffle(self.train_unseen_cameras)
         data = deepcopy(self.cached_train[self.image_idx])
         data["image"] = data["image"].to(self.device)
 

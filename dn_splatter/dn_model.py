@@ -83,8 +83,13 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     """Use TV loss on predicted normals."""
     normal_supervision: Literal["mono", "depth"] = "mono"
     """Type of supervision for normals. Mono for monocular normals and depth for pseudo normals from depth maps."""
-    normal_lambda: float = 0.1
-    """Regularizer for normal loss"""
+    normal_lambda: float = 1.0
+    """Weight on the normal L1 (vs gt) term. 1.0 = prior effective weight (was stored-but-unused);
+    raise to strengthen normal-direction supervision. Only active when use_normal_loss=True."""
+    normal_smooth_lambda: float = 3.0
+    """Weight on the normal SMOOTHNESS term (penalizes neighbour-to-neighbour normal jitter).
+    3.0 (the value that flattened the noisy floor normals in the sweep) is the default; raise for
+    more smoothing. Only active when use_normal_loss=True."""
     use_sparse_loss: bool = False
     """Encourage opacities to be 0 or 1. From 'Neural volumes: Learning dynamic renderable volumes from images'."""
     sparse_lambda: float = 0.1
@@ -121,6 +126,17 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     # pearson depth loss lambda
     pearson_lambda: float = 0
     """Regularizer for pearson depth loss"""
+
+    # RobustNeRF-style robust RGB loss (ignore transient distractors, e.g. a moving operator shadow)
+    use_robust_loss: bool = False
+    """Replace the mean RGB L1 with a robustly-weighted mean that rejects per-pixel outliers
+    (RobustNeRF, Sabour et al. 2023). Geometry stays anchored by the depth/normal losses."""
+    robust_inlier_quantile: float = 0.9
+    """Keep the lowest-residual this fraction of pixels each step; the rest are candidate distractors."""
+    robust_warmup_steps: int = 1000
+    """Don't apply robust masking until the model is partly converged (early residuals are meaningless)."""
+    robust_kernel: int = 3
+    """Box-filter size for the spatial-coherence step (clustered outliers stay masked; scattered detail is kept)."""
 
 
 class DNSplatterModel(SplatfactoModel):
@@ -263,6 +279,10 @@ class DNSplatterModel(SplatfactoModel):
 
         if not self.config.use_normal_loss:
             self.regularization_strategy.normal_loss = None
+        else:
+            # push the (now actually-applied) normal weights from config into the strategy
+            self.regularization_strategy.normal_lambda = self.config.normal_lambda
+            self.regularization_strategy.normal_smooth_lambda = self.config.normal_smooth_lambda
 
     @property
     def normals(self):
@@ -489,7 +509,9 @@ class DNSplatterModel(SplatfactoModel):
                 self.step // self.config.sh_degree_interval, self.config.sh_degree
             )
         else:
-            colors_crop = torch.sigmoid(colors_crop)
+            # sh_degree==0: take the DC term -> [N, 3] precomputed colors (rasterizer wants dim==2,
+            # not [N, 1, 3]). Mirrors base splatfacto's `colors_crop[:, 0, :]`.
+            colors_crop = torch.sigmoid(colors_crop[:, 0, :])
             sh_degree_to_use = None
 
         render, alpha, info = rasterization(
@@ -592,7 +614,7 @@ class DNSplatterModel(SplatfactoModel):
             fy=self.camera.fy.item(),
             cx=self.camera.cx.item(),
             cy=self.camera.cy.item(),
-            img_size=(self.camera.width.item(), self.camera.height.item()),
+            img_size=(depth_im.shape[1], depth_im.shape[0]),
             c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
             device=self.device,
             smooth=False,
@@ -610,6 +632,33 @@ class DNSplatterModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
+
+    def _robust_rgb_weight(self, pred_img, gt_img):
+        """RobustNeRF inlier weight (1=keep, 0=reject as distractor) + diagnostic stats. No grad.
+
+        1) per-pixel residual; 2) adaptive threshold at `robust_inlier_quantile`;
+        3) 3x3 box-filter so *clustered* outliers (a shadow) stay masked but *scattered*
+        high-residual pixels (fine texture/edges) are kept.
+        """
+        with torch.no_grad():
+            res = (pred_img - gt_img).abs().mean(dim=-1)  # [H, W]
+            t = torch.quantile(res.flatten(), self.config.robust_inlier_quantile)
+            inlier = (res <= t).float()
+            k = self.config.robust_kernel
+            w = F.avg_pool2d(inlier[None, None], k, stride=1, padding=k // 2)[0, 0]
+            W = (w >= 0.5).float()
+            kept, masked = W.bool(), (W < 0.5)
+            res_kept = float(res[kept].mean().item()) if kept.any() else 0.0
+            res_masked = float(res[masked].mean().item()) if masked.any() else 0.0
+            stats = {
+                "robust_frac_masked": float((1.0 - W.mean()).item()),
+                "robust_thresh": float(t.item()),
+                "robust_res_kept": res_kept,
+                "robust_res_masked": res_masked,
+                # >1 means rejected pixels are genuinely worse than kept ones (mask finds real outliers)
+                "robust_res_ratio": res_masked / (res_kept + 1e-8),
+            }
+        return W, stats
 
     def get_loss_dict(
         self, outputs, batch, metrics_dict=None
@@ -659,8 +708,20 @@ class DNSplatterModel(SplatfactoModel):
             if "normal" in outputs:
                 outputs["normal"] = outputs["normal"] * mask
 
-        # RGB loss
-        rgb_loss = main_loss
+        # RGB loss — optionally RobustNeRF-weighted (rejects transient distractors like a moving shadow).
+        # Reuses the mask computed in get_metrics_dict this same step (so loss and logged stats match).
+        robust_W = getattr(self, "_robust_W", None)
+        if self.config.use_robust_loss and robust_W is not None:
+            res = (pred_img - gt_img).abs().mean(dim=-1)  # [H, W], keeps grad
+            if "mask" in batch:
+                robust_W = robust_W * batch["mask"].to(self.device)[..., 0]
+            Ll1 = (robust_W * res).sum() / (robust_W.sum() + 1e-6)
+            simloss = 1 - self.ssim(
+                gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...]
+            )
+            rgb_loss = (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss
+        else:
+            rgb_loss = main_loss
 
         pred_normal = outputs["normal"]
         surface_normal = outputs["surface_normal"]
@@ -673,7 +734,7 @@ class DNSplatterModel(SplatfactoModel):
                 fy=self.camera.fy.item(),
                 cx=self.camera.cx.item(),
                 cy=self.camera.cy.item(),
-                img_size=(self.camera.width.item(), self.camera.height.item()),
+                img_size=(depth_out.shape[1], depth_out.shape[0]),
                 c2w=torch.eye(4, dtype=torch.float, device=depth_out.device),
                 device=self.device,
                 smooth=False,
@@ -725,6 +786,16 @@ class DNSplatterModel(SplatfactoModel):
             )
 
         main_loss = rgb_loss + regularization_strategy_loss
+
+        # Per-term loss logging: each loss we actually train on, logged directly (no by-difference
+        # decomposition, which broke under the robust RGB loss). Shows up as Train Metrics Dict/loss_*.
+        if metrics_dict is not None:
+            metrics_dict["loss_rgb"] = rgb_loss.detach()
+            metrics_dict["loss_scale_reg"] = (
+                scale_reg.detach() if torch.is_tensor(scale_reg) else torch.tensor(float(scale_reg))
+            )
+            for k, v in getattr(self.regularization_strategy, "last_components", {}).items():
+                metrics_dict[k] = v
 
         return {"main_loss": main_loss, "scale_reg": scale_reg}
 
@@ -804,6 +875,22 @@ class DNSplatterModel(SplatfactoModel):
             {"avg_min_scale": torch.nanmean(torch.exp(self.scales[..., -1]))}
         )
 
+        # RobustNeRF: compute the inlier mask once here, stash it for get_loss_dict, and log
+        # diagnostics so we can see the loss working (frac masked, and how much worse the rejected
+        # pixels are than the kept ones -> robust_res_ratio >> 1 means it's finding real distractors).
+        if (
+            self.config.use_robust_loss
+            and self.training
+            and self.step >= self.config.robust_warmup_steps
+        ):
+            W, rstats = self._robust_rgb_weight(
+                outputs["rgb"], self.get_gt_img(batch["image"]).clamp(min=10 / 255.0)
+            )
+            self._robust_W = W
+            metrics_dict.update(rstats)
+        else:
+            self._robust_W = None
+
         return metrics_dict
 
     def get_image_metrics_and_images(
@@ -835,6 +922,14 @@ class DNSplatterModel(SplatfactoModel):
             if outputs["normal"].dim() == 4
             else outputs["normal"]
         )
+
+        # undistorted datasets can render 1px off the GT size; crop all to a common size
+        H = min(gt_rgb.shape[0], predicted_rgb.shape[0])
+        W = min(gt_rgb.shape[1], predicted_rgb.shape[1])
+        gt_rgb = gt_rgb[:H, :W]
+        predicted_rgb = predicted_rgb[:H, :W]
+        predicted_depth = predicted_depth[:H, :W]
+        predicted_normal = predicted_normal[:H, :W]
 
         combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
         combined_depth = (
@@ -922,6 +1017,15 @@ class DNSplatterModel(SplatfactoModel):
             "depth": combined_depth,
             "normal": combined_normal,
         }
+
+        # RobustNeRF: show where the mask lands on this held-out frame (red = rejected as distractor)
+        if self.config.use_robust_loss:
+            pr = outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
+            gt = batch["image"].to(self.device)
+            W, _ = self._robust_rgb_weight(pr, gt.clamp(min=10 / 255.0))
+            overlay = gt.clone()
+            overlay[W < 0.5] = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            images_dict["robust_mask"] = torch.cat([gt, overlay], dim=1)
 
         return metrics_dict, images_dict
 
