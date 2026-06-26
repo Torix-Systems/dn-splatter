@@ -90,6 +90,9 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     """Weight on the normal SMOOTHNESS term (penalizes neighbour-to-neighbour normal jitter).
     3.0 (the value that flattened the noisy floor normals in the sweep) is the default; raise for
     more smoothing. Only active when use_normal_loss=True."""
+    scale_lambda: float = 1.0
+    """Weight on the DN min-scale (flatness) regularization term in the dn-splatter reg loss. 1.0 = prior
+    behaviour (it was added at full weight, unweighted); set 0 to disable it. Always active (not gated)."""
     use_sparse_loss: bool = False
     """Encourage opacities to be 0 or 1. From 'Neural volumes: Learning dynamic renderable volumes from images'."""
     sparse_lambda: float = 0.1
@@ -283,6 +286,9 @@ class DNSplatterModel(SplatfactoModel):
             # push the (now actually-applied) normal weights from config into the strategy
             self.regularization_strategy.normal_lambda = self.config.normal_lambda
             self.regularization_strategy.normal_smooth_lambda = self.config.normal_smooth_lambda
+
+        # the min-scale flatness term is always part of the dn-splatter reg loss -> weight it unconditionally
+        self.regularization_strategy.scale_lambda = self.config.scale_lambda
 
     @property
     def normals(self):

@@ -131,6 +131,7 @@ class DNRegularization(RegularizationStrategy):
         depth_lambda: float = 0.2,
         normal_lambda: float = 1.0,
         normal_smooth_lambda: float = 1.0,
+        scale_lambda: float = 1.0,
     ):
         super().__init__()
         self.depth_tolerance = depth_tolerance
@@ -144,19 +145,22 @@ class DNRegularization(RegularizationStrategy):
         self.normal_smooth_loss = NormalLoss(self.normal_smooth_loss_type)
         self.normal_lambda = normal_lambda
         self.normal_smooth_lambda = normal_smooth_lambda
+        self.scale_lambda = scale_lambda
         self.last_components: dict = {}
 
     def get_loss(self, pred_depth, gt_depth, pred_normal, gt_normal, **kwargs):
-        """Regularization loss. Normal terms are weighted (normal_lambda / normal_smooth_lambda) and
-        each component is stashed in self.last_components for accurate per-term TensorBoard logging."""
+        """Regularization loss. EVERY term added to main_loss is explicitly weighted by its own lambda
+        (depth_lambda / normal_lambda / normal_smooth_lambda / scale_lambda) here in one place; the
+        get_*_loss helpers return RAW losses. Each weighted component is stashed in self.last_components
+        for accurate per-term TensorBoard logging."""
         depth_loss = 0.0
         if self.depth_loss is not None:
-            depth_loss = self.get_depth_loss(pred_depth, gt_depth, **kwargs)
+            depth_loss = self.depth_lambda * self.get_depth_loss(pred_depth, gt_depth, **kwargs)
         normal_l1, normal_smooth = 0.0, 0.0
         if self.normal_loss is not None:
             normal_l1 = self.normal_lambda * self.normal_loss(pred_normal, gt_normal)
             normal_smooth = self.normal_smooth_lambda * self.normal_smooth_loss(pred_normal)
-        scale_loss = self.get_scale_loss(scales=kwargs["scales"])
+        scale_loss = self.scale_lambda * self.get_scale_loss(scales=kwargs["scales"])
 
         def _d(x):
             return x.detach() if torch.is_tensor(x) else torch.tensor(float(x))
@@ -195,8 +199,9 @@ class DNRegularization(RegularizationStrategy):
                 pred_depth[valid_gt_mask], gt_depth[valid_gt_mask].float()
             )
 
-        depth_loss += self.depth_lambda * depth_loss
-
+        # Return the RAW depth loss. depth_lambda is applied uniformly in get_loss, alongside every other
+        # term. (Upstream applied it here as `depth_loss += depth_lambda * depth_loss` = (1+lambda)*raw,
+        # which pinned the depth loss at full weight and made depth_lambda a near-no-op — that bug is gone.)
         return depth_loss
 
     def get_normal_loss(self, pred_normal, gt_normal, **kwargs):
