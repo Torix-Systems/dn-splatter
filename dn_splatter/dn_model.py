@@ -93,6 +93,13 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     scale_lambda: float = 1.0
     """Weight on the DN min-scale (flatness) regularization term in the dn-splatter reg loss. 1.0 = prior
     behaviour (it was added at full weight, unweighted); set 0 to disable it. Always active (not gated)."""
+    use_color_correction: bool = False
+    """Per-image affine color correction (per-channel gain+bias) on the render BEFORE the RGB loss, so
+    the model absorbs per-frame white-balance/exposure drift instead of baking it into the gaussians.
+    Training only (indexed by train cam_idx); eval/inference render stays canonical (identity)."""
+    color_correction_reg: float = 1e-3
+    """L2 pull of the per-image color params toward identity (gain=1, bias=0) so the correction can't
+    explain away real scene content. 0 disables the pull."""
     use_sparse_loss: bool = False
     """Encourage opacities to be 0 or 1. From 'Neural volumes: Learning dynamic renderable volumes from images'."""
     sparse_lambda: float = 0.1
@@ -264,6 +271,11 @@ class DNSplatterModel(SplatfactoModel):
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
+
+        # per-image affine color correction table: [log_gain(3), bias(3)] per train image.
+        # init 0 -> gain=exp(0)=1, bias=0 (identity). Absorbs per-frame white-balance/exposure drift.
+        if self.config.use_color_correction:
+            self.color_correction = Parameter(torch.zeros(self.num_train_data, 6))
 
         if self.config.regularization_strategy == "dn-splatter":
             self.regularization_strategy = DNRegularization()
@@ -666,6 +678,14 @@ class DNSplatterModel(SplatfactoModel):
             }
         return W, stats
 
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        # splatfacto's groups (gauss params + camera_opt) plus the per-image color-correction table.
+        # Only added when enabled, so the "color_correction" optimizer config is otherwise just ignored.
+        gps = super().get_param_groups()
+        if self.config.use_color_correction:
+            gps["color_correction"] = [self.color_correction]
+        return gps
+
     def get_loss_dict(
         self, outputs, batch, metrics_dict=None
     ) -> Dict[str, torch.Tensor]:
@@ -676,6 +696,18 @@ class DNSplatterModel(SplatfactoModel):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
+        # per-image affine color correction: absorb per-frame white-balance/exposure drift so it is
+        # NOT baked into the gaussians. Applied to the render BEFORE the loss, so both the base RGB
+        # loss (computed in super().get_loss_dict) and the robust path below see the corrected pred.
+        # Training only; eval/inference leaves outputs["rgb"] untouched (canonical scene).
+        if (
+            self.config.use_color_correction
+            and self.training
+            and getattr(self, "camera_idx", None) is not None
+        ):
+            cc = self.color_correction[self.camera_idx]  # [6] = [log_gain(3), bias(3)]
+            outputs["rgb"] = (torch.exp(cc[:3]) * outputs["rgb"] + cc[3:]).clamp(0.0, 1.0)
+
         loss_dict = super().get_loss_dict(
             outputs=outputs, batch=batch, metrics_dict=metrics_dict
         )
@@ -793,6 +825,17 @@ class DNSplatterModel(SplatfactoModel):
 
         main_loss = rgb_loss + regularization_strategy_loss
 
+        # keep the per-image color correction near identity so it can't explain away real scene content
+        if (
+            self.config.use_color_correction
+            and self.config.color_correction_reg > 0
+            and self.training
+        ):
+            cc_reg = self.config.color_correction_reg * self.color_correction.pow(2).mean()
+            main_loss = main_loss + cc_reg
+            if metrics_dict is not None:
+                metrics_dict["loss_color_cc_reg"] = cc_reg.detach()
+
         # Per-term loss logging: each loss we actually train on, logged directly (no by-difference
         # decomposition, which broke under the robust RGB loss). Shows up as Train Metrics Dict/loss_*.
         if metrics_dict is not None:
@@ -838,6 +881,19 @@ class DNSplatterModel(SplatfactoModel):
         predicted_rgb = (
             outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
         )
+
+        # When color correction is on, score the TRAIN RGB metrics on the CORRECTED render (what the
+        # model actually fits). Otherwise PSNR/SSIM/LPIPS are penalized by the per-frame white-balance
+        # drift the correction absorbs, making cc runs look ~3-4 PSNR worse than they are. Metric-only:
+        # the robust mask below still uses raw outputs["rgb"]; eval (self.training=False) is untouched
+        # (held-out images have no learned correction).
+        if (
+            self.config.use_color_correction
+            and self.training
+            and getattr(self, "camera_idx", None) is not None
+        ):
+            cc = self.color_correction[self.camera_idx]  # [log_gain(3), bias(3)]
+            predicted_rgb = (torch.exp(cc[:3]) * predicted_rgb + cc[3:]).clamp(0.0, 1.0)
 
         # comment out for now, as it will slow down the training speed.
         (psnr, ssim, lpips) = self.rgb_metrics(

@@ -26,6 +26,7 @@ class DepthLossType(Enum):
     HuberL1 = "HuberL1"
     TV = "TV"
     EdgeAwareLogL1 = "EdgeAwareLogL1"
+    EdgeAwareLogDepthL1 = "EdgeAwareLogDepthL1"
     EdgeAwareTV = "EdgeAwareTV"
     PearsonDepth = "PearsonDepth"
     LocalPearsonDepthLoss = "LocalPearsonDepthLoss"
@@ -56,6 +57,8 @@ class DepthLoss(nn.Module):
             return HuberL1(**self.kwargs)
         elif self.depth_loss_type == DepthLossType.EdgeAwareLogL1:
             return EdgeAwareLogL1(**self.kwargs)
+        elif self.depth_loss_type == DepthLossType.EdgeAwareLogDepthL1:
+            return EdgeAwareLogDepthL1(**self.kwargs)
         elif self.depth_loss_type == DepthLossType.EdgeAwareTV:
             return EdgeAwareTV(**self.kwargs)
         elif self.depth_loss_type == DepthLossType.TV:
@@ -208,6 +211,59 @@ class EdgeAwareLogL1(nn.Module):
 
         loss_x = lambda_x * logl1[..., :, :-1, :]
         loss_y = lambda_y * logl1[..., :-1, :, :]
+
+        if self.implementation == "per-pixel":
+            if mask is not None:
+                loss_x[~mask[..., :, :-1, :]] = 0
+                loss_y[~mask[..., :-1, :, :]] = 0
+            return loss_x[..., :-1, :, :] + loss_y[..., :, :-1, :]
+
+        if mask is not None:
+            assert mask.shape[:2] == pred.shape[:2]
+            loss_x = loss_x[mask[..., :, :-1, :]]
+            loss_y = loss_y[mask[..., :-1, :, :]]
+
+        if self.implementation == "scalar":
+            return loss_x.mean() + loss_y.mean()
+
+
+class EdgeAwareLogDepthL1(nn.Module):
+    """Edge-aware L1 on LOG-DEPTH: per-pixel |log(pred) - log(gt)| (= |log(pred/gt)|, the RELATIVE
+    depth error), RGB-edge weighted exactly like EdgeAwareLogL1. Penalizes a fixed *percent* depth
+    error equally near and far, so far points (whose absolute error grows with depth) don't dominate
+    the loss. Use when depth error is correlated with depth (LiDAR/triangulation). Requires positive
+    metric depth; gt is clamped to eps and invalid pixels are zeroed via the caller's mask.
+
+    Drop-in for EdgeAwareLogL1 — same (pred, gt, rgb, mask) signature — so it isolates the single
+    change of residual-space -> log-depth-space supervision."""
+
+    def __init__(
+        self,
+        implementation: Literal["scalar", "per-pixel"] = "scalar",
+        eps: float = 1e-3,
+        **kwargs,
+    ):
+        super().__init__()
+        self.implementation = implementation
+        self.eps = eps
+
+    def forward(self, pred: Tensor, gt: Tensor, rgb: Tensor, mask: Optional[Tensor]):
+        # relative depth error per pixel; clamp guards log(0) on invalid/zero gt (masked out below)
+        logd = torch.abs(
+            torch.log(pred.clamp(min=self.eps)) - torch.log(gt.clamp(min=self.eps))
+        )
+
+        grad_img_x = torch.mean(
+            torch.abs(rgb[..., :, :-1, :] - rgb[..., :, 1:, :]), -1, keepdim=True
+        )
+        grad_img_y = torch.mean(
+            torch.abs(rgb[..., :-1, :, :] - rgb[..., 1:, :, :]), -1, keepdim=True
+        )
+        lambda_x = torch.exp(-grad_img_x)
+        lambda_y = torch.exp(-grad_img_y)
+
+        loss_x = lambda_x * logd[..., :, :-1, :]
+        loss_y = lambda_y * logd[..., :-1, :, :]
 
         if self.implementation == "per-pixel":
             if mask is not None:

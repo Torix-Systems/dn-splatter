@@ -65,6 +65,10 @@ dn_splatter = MethodSpecification(
                 ),  # this does nothing, its just here to make the trainer happy
                 "scheduler": None,
             },
+            "color_correction": {  # per-image affine WB/exposure correction; ignored unless use_color_correction
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+                "scheduler": None,
+            },
         },
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
@@ -125,6 +129,10 @@ ags_mesh = MethodSpecification(
                 "optimizer": AdamOptimizerConfig(
                     lr=1e-3, eps=1e-15
                 ),  # this does nothing, its just here to make the trainer happy
+                "scheduler": None,
+            },
+            "color_correction": {  # per-image affine WB/exposure correction; ignored unless use_color_correction
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
                 "scheduler": None,
             },
         },

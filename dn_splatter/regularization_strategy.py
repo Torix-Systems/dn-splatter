@@ -177,7 +177,10 @@ class DNRegularization(RegularizationStrategy):
         """Depth loss"""
 
         valid_gt_mask = gt_depth > self.depth_tolerance
-        if self.depth_loss_type == DepthLossType.EdgeAwareLogL1:
+        if self.depth_loss_type in (
+            DepthLossType.EdgeAwareLogL1,
+            DepthLossType.EdgeAwareLogDepthL1,
+        ):
             gt_img = kwargs["gt_img"]
             depth_loss = self.depth_loss(
                 pred_depth, gt_depth.float(), gt_img, valid_gt_mask
