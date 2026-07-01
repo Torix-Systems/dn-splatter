@@ -59,6 +59,14 @@ dn_splatter = MethodSpecification(
                     lr_final=5e-5, max_steps=30000
                 ),
             },
+            "pose_scale": {  # one global learned metric-scale scalar (only used if optimize_pose_scale)
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+                "scheduler": None,
+            },
+            "bilateral_grid": {  # per-image bilateral grid (only used if use_bilateral_grid)
+                "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=30000),
+            },
             "normals": {
                 "optimizer": AdamOptimizerConfig(
                     lr=1e-3, eps=1e-15
@@ -124,6 +132,14 @@ ags_mesh = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=5e-5, max_steps=30000
                 ),
+            },
+            "pose_scale": {  # one global learned metric-scale scalar (only used if optimize_pose_scale)
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+                "scheduler": None,
+            },
+            "bilateral_grid": {  # per-image bilateral grid (only used if use_bilateral_grid)
+                "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=30000),
             },
             "normals": {
                 "optimizer": AdamOptimizerConfig(
@@ -193,6 +209,14 @@ dn_splatter_big = MethodSpecification(
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=5e-5, max_steps=30000
                 ),
+            },
+            "pose_scale": {  # one global learned metric-scale scalar (only used if optimize_pose_scale)
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+                "scheduler": None,
+            },
+            "bilateral_grid": {  # per-image bilateral grid (only used if use_bilateral_grid)
+                "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=30000),
             },
             "normals": {
                 "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),

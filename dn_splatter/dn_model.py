@@ -93,6 +93,13 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     scale_lambda: float = 1.0
     """Weight on the DN min-scale (flatness) regularization term in the dn-splatter reg loss. 1.0 = prior
     behaviour (it was added at full weight, unweighted); set 0 to disable it. Always active (not gated)."""
+    use_bilateral_grid: bool = False
+    """Per-image BILATERAL GRID appearance correction (Wang et al., "Bilateral Guided Radiance Field
+    Processing"; the module nerfstudio/gsplat use) on the render BEFORE the RGB loss — the established
+    alternative to use_color_correction. Training only (indexed by train cam_idx); eval stays canonical."""
+    bilgrid_tv_loss_mult: float = 10.0
+    """Total-variation smoothness weight on the bilateral grids (keeps them locally smooth)."""
+
     use_color_correction: bool = False
     """Per-image affine color correction (per-channel gain+bias) on the render BEFORE the RGB loss, so
     the model absorbs per-frame white-balance/exposure drift instead of baking it into the gaussians.
@@ -132,6 +139,11 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     """Config of the camera optimizer to use"""
     output_depth_during_training: bool = True
     """If True, output depth during training. Otherwise, only output depth during evaluation."""
+
+    optimize_pose_scale: bool = False
+    """If True, learn ONE global scalar sigma that scales all camera translations + the scene
+    together (a similarity, so the RGB render is invariant and only the metric depth loss drives it).
+    Reconciles the SfM/pose scale with the LiDAR metric scale. Requires depth loss ON to have effect."""
 
     # pearson depth loss lambda
     pearson_lambda: float = 0
@@ -272,10 +284,22 @@ class DNSplatterModel(SplatfactoModel):
             num_cameras=self.num_train_data, device="cpu"
         )
 
+        # learned global metric-scale (see get_outputs / optimize_pose_scale). log-space -> sigma=exp,
+        # init 0 => sigma=1 (identity). Frozen unless optimize_pose_scale is set.
+        self.log_pose_scale = Parameter(torch.zeros(1))
+        if not self.config.optimize_pose_scale:
+            self.log_pose_scale.requires_grad_(False)
+
         # per-image affine color correction table: [log_gain(3), bias(3)] per train image.
         # init 0 -> gain=exp(0)=1, bias=0 (identity). Absorbs per-frame white-balance/exposure drift.
         if self.config.use_color_correction:
             self.color_correction = Parameter(torch.zeros(self.num_train_data, 6))
+
+        # per-image bilateral grid appearance model (alternative to color_correction)
+        if self.config.use_bilateral_grid:
+            from dn_splatter.lib_bilagrid import BilateralGrid
+
+            self.bil_grids = BilateralGrid(num=self.num_train_data)
 
         if self.config.regularization_strategy == "dn-splatter":
             self.regularization_strategy = DNRegularization()
@@ -461,6 +485,18 @@ class DNSplatterModel(SplatfactoModel):
         else:
             optimized_camera_to_world = camera.camera_to_worlds
 
+        # global metric-scale correction: scale camera center + scene (means & scales below) together.
+        # Similarity => RGB render is invariant; only the metric depth loss drives this scalar. sigma=1
+        # when disabled. Built functionally (no in-place) so autograd can reach log_pose_scale.
+        pose_scale = torch.exp(self.log_pose_scale)
+        optimized_camera_to_world = torch.cat(
+            [
+                optimized_camera_to_world[..., :3, :3],
+                optimized_camera_to_world[..., :3, 3:4] * pose_scale,
+            ],
+            dim=-1,
+        )
+
         # binary opacities
         if self.config.use_binary_opacities and self.step > self.config.warmup_length:
             skip_steps = self.config.reset_alpha_every * self.config.refine_every
@@ -533,9 +569,9 @@ class DNSplatterModel(SplatfactoModel):
             sh_degree_to_use = None
 
         render, alpha, info = rasterization(
-            means=means_crop,
+            means=means_crop * pose_scale,
             quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            scales=torch.exp(scales_crop),
+            scales=torch.exp(scales_crop) * pose_scale,
             opacities=torch.sigmoid(opacities_crop).squeeze(-1),
             colors=colors_crop,
             viewmats=viewmat,  # [1, 4, 4]
@@ -678,12 +714,30 @@ class DNSplatterModel(SplatfactoModel):
             }
         return W, stats
 
+    def _apply_bilateral_grid(self, rgb, cam_idx):
+        """Apply the per-image bilateral grid to a [H,W,3] render (values in [0,1])."""
+        from dn_splatter.lib_bilagrid import slice as _bilslice
+
+        H, W = rgb.shape[0], rgb.shape[1]
+        gy, gx = torch.meshgrid(
+            torch.linspace(0, 1, H, device=rgb.device),
+            torch.linspace(0, 1, W, device=rgb.device),
+            indexing="ij",
+        )
+        grid_xy = torch.stack([gx, gy], dim=-1)  # [H,W,2] in [0,1]
+        idx = torch.full((H, W, 1), int(cam_idx), device=rgb.device, dtype=torch.long)
+        return _bilslice(self.bil_grids, grid_xy, rgb, idx)["rgb"].clamp(0.0, 1.0)
+
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         # splatfacto's groups (gauss params + camera_opt) plus the per-image color-correction table.
         # Only added when enabled, so the "color_correction" optimizer config is otherwise just ignored.
         gps = super().get_param_groups()
         if self.config.use_color_correction:
             gps["color_correction"] = [self.color_correction]
+        if self.config.use_bilateral_grid:
+            gps["bilateral_grid"] = list(self.bil_grids.parameters())
+        if self.config.optimize_pose_scale:
+            gps["pose_scale"] = [self.log_pose_scale]
         return gps
 
     def get_loss_dict(
@@ -707,6 +761,12 @@ class DNSplatterModel(SplatfactoModel):
         ):
             cc = self.color_correction[self.camera_idx]  # [6] = [log_gain(3), bias(3)]
             outputs["rgb"] = (torch.exp(cc[:3]) * outputs["rgb"] + cc[3:]).clamp(0.0, 1.0)
+        if (
+            self.config.use_bilateral_grid
+            and self.training
+            and getattr(self, "camera_idx", None) is not None
+        ):
+            outputs["rgb"] = self._apply_bilateral_grid(outputs["rgb"], self.camera_idx)
 
         loss_dict = super().get_loss_dict(
             outputs=outputs, batch=batch, metrics_dict=metrics_dict
@@ -836,6 +896,13 @@ class DNSplatterModel(SplatfactoModel):
             if metrics_dict is not None:
                 metrics_dict["loss_color_cc_reg"] = cc_reg.detach()
 
+        # bilateral-grid total-variation smoothness reg
+        if self.config.use_bilateral_grid and self.training:
+            bg_tv = self.config.bilgrid_tv_loss_mult * self.bil_grids.tv_loss()
+            main_loss = main_loss + bg_tv
+            if metrics_dict is not None:
+                metrics_dict["loss_bilgrid_tv"] = bg_tv.detach()
+
         # Per-term loss logging: each loss we actually train on, logged directly (no by-difference
         # decomposition, which broke under the robust RGB loss). Shows up as Train Metrics Dict/loss_*.
         if metrics_dict is not None:
@@ -894,6 +961,12 @@ class DNSplatterModel(SplatfactoModel):
         ):
             cc = self.color_correction[self.camera_idx]  # [log_gain(3), bias(3)]
             predicted_rgb = (torch.exp(cc[:3]) * predicted_rgb + cc[3:]).clamp(0.0, 1.0)
+        if (
+            self.config.use_bilateral_grid
+            and self.training
+            and getattr(self, "camera_idx", None) is not None
+        ):
+            predicted_rgb = self._apply_bilateral_grid(predicted_rgb, self.camera_idx)
 
         # comment out for now, as it will slow down the training speed.
         (psnr, ssim, lpips) = self.rgb_metrics(
@@ -952,6 +1025,10 @@ class DNSplatterModel(SplatfactoModel):
             metrics_dict.update(rstats)
         else:
             self._robust_W = None
+
+        # log the learned global metric-scale to tensorboard (sigma = exp(log_pose_scale))
+        if self.config.optimize_pose_scale:
+            metrics_dict["pose_scale"] = torch.exp(self.log_pose_scale.detach()).squeeze()
 
         return metrics_dict
 
